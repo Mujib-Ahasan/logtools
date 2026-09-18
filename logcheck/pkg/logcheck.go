@@ -42,6 +42,7 @@ const (
 	verbosityErrorCheck = "verbosity-error"
 	keyCheck            = "key"
 	valueCheck          = "value"
+	nilStringerCheck    = "nil-stringer"
 	deprecationsCheck   = "deprecations"
 	loggerCheck         = "logger-constructor"
 )
@@ -82,6 +83,7 @@ func Analyser() (*analysis.Analyzer, *Config) {
 			verbosityErrorCheck: new(bool),
 			keyCheck:            new(bool),
 			valueCheck:          new(bool),
+			nilStringerCheck:    new(bool),
 			deprecationsCheck:   new(bool),
 			loggerCheck:         new(bool),
 		},
@@ -100,7 +102,8 @@ klog methods (Info, Infof, Error, Errorf, Warningf, etc).`)
 	logcheckFlags.BoolVar(c.enabled[verbosityZeroCheck], prefix+verbosityZeroCheck, true, `When true, logcheck will check whether the parameter for V() is 0.`)
 	logcheckFlags.BoolVar(c.enabled[verbosityErrorCheck], prefix+verbosityErrorCheck, true, `When true, logcheck will check for V() in front of a logr Error call.`)
 	logcheckFlags.BoolVar(c.enabled[keyCheck], prefix+keyCheck, true, `When true, logcheck will check whether name arguments are valid keys according to the guidelines in (https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/migration-to-structured-logging.md#name-arguments).`)
-	logcheckFlags.BoolVar(c.enabled[valueCheck], prefix+valueCheck, false, `When true, logcheck will check for problematic values (for example, types that have an incomplete fmt.Stringer implementation or pointers whose value type implements fmt.Stringer with a value receiver, which panics in String() for a nil pointer).`)
+	logcheckFlags.BoolVar(c.enabled[valueCheck], prefix+valueCheck, false, `When true, logcheck will check for problematic values (for example, types that have an incomplete fmt.Stringer implementation).`)
+	logcheckFlags.BoolVar(c.enabled[nilStringerCheck], prefix+nilStringerCheck, true, `When true, logcheck will flag pointer values in structured logging calls whose fmt.Stringer implementation panics when the pointer is nil because calling String() must dereference the pointer. Such values should be wrapped with klog.SafePtr.`)
 	logcheckFlags.BoolVar(c.enabled[deprecationsCheck], prefix+deprecationsCheck, true, `When true, logcheck will analyze the usage of deprecated Klog function calls.`)
 	logcheckFlags.BoolVar(c.enabled[loggerCheck], prefix+loggerCheck, false, `When true and the "contextual" check is also enabled, logcheck will warn about call sites which construct a configuration struct with an optional "Logger *logr.Logger" (or klog.Logger) field without setting that field, based on a best-effort data flow analysis. Call sites where the configuration struct cannot be analyzed (for example, because it was received as a parameter) are silently skipped.`)
 	logcheckFlags.Var(&c.fileOverrides, "config", `A file which overrides the global settings for checks on a per-file basis via regular expressions.`)
@@ -216,6 +219,7 @@ func checkForFunctionExpr(fexpr *ast.CallExpr, pass *analysis.Pass, c *Config) {
 		fName := selExpr.Sel.Name
 
 		valueCheckEnabled := c.isEnabled(valueCheck, filename)
+		nilStringerCheckEnabled := c.isEnabled(nilStringerCheck, filename)
 		keyCheckEnabled := c.isEnabled(keyCheck, filename)
 		parametersCheckEnabled := c.isEnabled(parametersCheck, filename)
 
@@ -264,7 +268,7 @@ func checkForFunctionExpr(fexpr *ast.CallExpr, pass *analysis.Pass, c *Config) {
 			// variadic input is a valid input to klog.Error*, klog.Info*, logr.Logger.Info and logr.Logger.Error
 			// functions. Hence checking the parameters for variadic input argument is excluded.
 			if !fexpr.Ellipsis.IsValid() {
-				if keyCheckEnabled || parametersCheckEnabled || valueCheckEnabled {
+				if keyCheckEnabled || parametersCheckEnabled || valueCheckEnabled || nilStringerCheckEnabled {
 					// if format specifier is used, check for arg length will most probably fail
 					// so check for format specifier first and skip if found
 					if parametersCheckEnabled && checkForFormatSpecifier(fexpr, pass) {
@@ -272,9 +276,9 @@ func checkForFunctionExpr(fexpr *ast.CallExpr, pass *analysis.Pass, c *Config) {
 					}
 					switch fName {
 					case "InfoS", "LoggerWithValues":
-						kvCheck(args[1:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled)
+						kvCheck(args[1:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled, nilStringerCheckEnabled)
 					case "ErrorS":
-						kvCheck(args[2:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled)
+						kvCheck(args[2:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled, nilStringerCheckEnabled)
 					}
 				}
 			}
@@ -284,7 +288,7 @@ func checkForFunctionExpr(fexpr *ast.CallExpr, pass *analysis.Pass, c *Config) {
 			}
 		} else if isGoLogger(selExpr.X, pass) {
 			if !fexpr.Ellipsis.IsValid() {
-				if keyCheckEnabled || parametersCheckEnabled || valueCheckEnabled {
+				if keyCheckEnabled || parametersCheckEnabled || valueCheckEnabled || nilStringerCheckEnabled {
 					// if format specifier is used, check for arg length will most probably fail
 					// so check for format specifier first and skip if found
 					if parametersCheckEnabled && checkForFormatSpecifier(fexpr, pass) {
@@ -292,11 +296,11 @@ func checkForFunctionExpr(fexpr *ast.CallExpr, pass *analysis.Pass, c *Config) {
 					}
 					switch fName {
 					case "WithValues":
-						kvCheck(args, fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled)
+						kvCheck(args, fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled, nilStringerCheckEnabled)
 					case "Info":
-						kvCheck(args[1:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled)
+						kvCheck(args[1:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled, nilStringerCheckEnabled)
 					case "Error":
-						kvCheck(args[2:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled)
+						kvCheck(args[2:], fun, pass, fName, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled, nilStringerCheckEnabled)
 					}
 				}
 			}
@@ -906,12 +910,17 @@ func isVerbosityZero(expr ast.Expr) bool {
 
 // kvCheck check if all keys in keyAndValues are valid keys according to the guidelines
 // and that the values can be formatted.
-func kvCheck(keyValues []ast.Expr, fun ast.Expr, pass *analysis.Pass, funName string, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled bool) {
+func kvCheck(keyValues []ast.Expr, fun ast.Expr, pass *analysis.Pass, funName string, keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled, nilStringerCheckEnabled bool) {
 	if len(keyValues)%2 != 0 {
-		pass.Report(analysis.Diagnostic{
-			Pos:     fun.Pos(),
-			Message: fmt.Sprintf("Additional arguments to %s should always be Key Value pairs. Please check if there is any key or value missing.", funName),
-		})
+		// This report belongs to the checks which existed before
+		// nil-stringer was added; it must not fire when only nil-stringer
+		// is enabled.
+		if keyCheckEnabled || parametersCheckEnabled || valueCheckEnabled {
+			pass.Report(analysis.Diagnostic{
+				Pos:     fun.Pos(),
+				Message: fmt.Sprintf("Additional arguments to %s should always be Key Value pairs. Please check if there is any key or value missing.", funName),
+			})
+		}
 		return
 	}
 
@@ -922,7 +931,7 @@ func kvCheck(keyValues []ast.Expr, fun ast.Expr, pass *analysis.Pass, funName st
 			checkKey(arg, pass, keyCheckEnabled, parametersCheckEnabled)
 		case 1:
 			// Value in key/value pair.
-			checkValue(arg, pass, valueCheckEnabled)
+			checkValue(arg, pass, valueCheckEnabled, nilStringerCheckEnabled)
 		}
 	}
 }
@@ -974,8 +983,8 @@ func checkKey(arg ast.Expr, pass *analysis.Pass, keyCheckEnabled, parametersChec
 }
 
 // checkValue checks the value in a key/value pair.
-func checkValue(arg ast.Expr, pass *analysis.Pass, valueCheckEnabled bool) {
-	if !valueCheckEnabled {
+func checkValue(arg ast.Expr, pass *analysis.Pass, valueCheckEnabled, nilStringerCheckEnabled bool) {
+	if !valueCheckEnabled && !nilStringerCheckEnabled {
 		return
 	}
 
@@ -984,44 +993,95 @@ func checkValue(arg ast.Expr, pass *analysis.Pass, valueCheckEnabled bool) {
 	if !ok {
 		return
 	}
-	if obj, index, _ := types.LookupFieldOrMethod(typeAndValue.Type, typeAndValue.Addressable(), nil /* package */, "String"); obj != nil {
-		if function, ok := obj.(*types.Func); ok && isFmtString(function) && len(index) > 1 && !isWrapperStruct(typeAndValue.Type) {
-			pass.Report(analysis.Diagnostic{
-				Pos:     arg.Pos(),
-				Message: fmt.Sprintf("The type %s inherits %s as implementation of fmt.Stringer, which covers only a subset of the value. Implement String() for the type or wrap it with TODO.", typeAndValue.Type.String(), function.FullName()), // TODO: https://github.com/kubernetes/kubernetes/pull/116952
-			})
-		}
-	}
 
-	/* A pointer whose element type implements fmt.Stringer with a value
-	   receiver panics in String() when the pointer is nil: the promoted
-	   method must dereference the pointer to get its value receiver. klog
-	   recovers from that panic and logs it instead of the value.
-	*/
-	if unary, ok := arg.(*ast.UnaryExpr); ok && unary.Op == token.AND {
-		// Taking the address of a value never yields a nil pointer.
+	if nilStringerCheckEnabled && checkNilStringer(arg, typeAndValue.Type, pass) {
+		// Reported, don't warn about the same String method again below.
 		return
 	}
-	if ptr, ok := unwrapAlias(typeAndValue.Type).(*types.Pointer); ok {
-		elem := unwrapAlias(ptr.Elem())
-		switch elem.Underlying().(type) {
-		case *types.Pointer, *types.Interface:
-			// A pointer to a pointer or to an interface does not
-			// implement fmt.Stringer, so String() never gets called.
-			return
-		}
-		// Look up String in the method set of the element type: those are
-		// exactly the value receiver methods which get promoted to the
-		// pointer type via an implicit dereference.
-		if selection := types.NewMethodSet(elem).Lookup(nil /* package */, "String"); selection != nil {
-			if function, ok := selection.Obj().(*types.Func); ok && isFmtString(function) {
+
+	if valueCheckEnabled {
+		if obj, index, _ := types.LookupFieldOrMethod(typeAndValue.Type, typeAndValue.Addressable(), nil /* package */, "String"); obj != nil {
+			if function, ok := obj.(*types.Func); ok && isFmtString(function) && len(index) > 1 && !isWrapperStruct(typeAndValue.Type) {
 				pass.Report(analysis.Diagnostic{
 					Pos:     arg.Pos(),
-					Message: fmt.Sprintf("The type %s implements fmt.Stringer via the value receiver method %s. Calling String() panics for a nil pointer, which klog then logs instead of the value. Wrap the value with klog.SafePtr.", typeAndValue.Type.String(), function.FullName()),
+					Message: fmt.Sprintf("The type %s inherits %s as implementation of fmt.Stringer, which covers only a subset of the value. Implement String() for the type or wrap it with TODO.", typeAndValue.Type.String(), function.FullName()), // TODO: https://github.com/kubernetes/kubernetes/pull/116952
 				})
 			}
 		}
 	}
+}
+
+/*
+checkNilStringer reports a pointer value whose fmt.Stringer implementation
+must dereference the pointer: String() then panics when the pointer is
+nil. This happens when String has a value receiver (calling it copies the
+value the pointer points to) and when String is promoted from a field
+that is embedded by value (selecting the field dereferences the pointer,
+even if the method itself has a nil-safe pointer receiver). klog recovers
+from that panic and logs it instead of the value, other logr.Logger
+implementations may crash. It returns true if it reported the value.
+*/
+func checkNilStringer(arg ast.Expr, t types.Type, pass *analysis.Pass) bool {
+	if isNeverNil(arg, pass) {
+		return false
+	}
+	ptr, ok := unwrapAlias(t).(*types.Pointer)
+	if !ok {
+		return false
+	}
+	elem := unwrapAlias(ptr.Elem())
+	switch elem.Underlying().(type) {
+	case *types.Pointer, *types.Interface:
+		return false
+	}
+	obj, index, _ := types.LookupFieldOrMethod(elem, true /* addressable */, nil /* package */, "String")
+	if obj == nil {
+		return false
+	}
+	// Calling the method dereferences the pointer unless String is declared
+	// directly on the element type (len(index) == 1) with a pointer
+	// receiver: promotion from an embedded field (len(index) > 1)
+	// dereferences the pointer to select the field, a value receiver
+	// dereferences it to copy the value.
+	function, ok := obj.(*types.Func)
+	if !ok || !isFmtString(function) || (len(index) == 1 && hasPointerReceiver(function)) {
+		return false
+	}
+	pass.Report(analysis.Diagnostic{
+		Pos:     arg.Pos(),
+		Message: fmt.Sprintf("The type %s implements fmt.Stringer through %s, which panics for a nil pointer because calling it dereferences the pointer. klog logs the panic instead of the value, other logger implementations may crash. Wrap the value with klog.SafePtr.", t.String(), function.FullName()),
+	})
+	return true
+}
+
+// isNeverNil returns true for expressions which cannot evaluate to a nil
+// pointer: taking the address of a value and new() both allocate.
+func isNeverNil(arg ast.Expr, pass *analysis.Pass) bool {
+	switch arg := ast.Unparen(arg).(type) {
+	case *ast.UnaryExpr:
+		return arg.Op == token.AND
+	case *ast.CallExpr:
+		if ident, ok := ast.Unparen(arg.Fun).(*ast.Ident); ok {
+			if builtin, ok := pass.TypesInfo.Uses[ident].(*types.Builtin); ok {
+				return builtin.Name() == "new"
+			}
+		}
+	}
+	return false
+}
+
+// hasPointerReceiver checks whether the method is declared with a pointer receiver.
+func hasPointerReceiver(function *types.Func) bool {
+	signature, ok := function.Type().(*types.Signature)
+	if !ok {
+		return false
+	}
+	recv := signature.Recv()
+	if recv == nil {
+		return false
+	}
+	_, ok = unwrapAlias(recv.Type()).(*types.Pointer)
+	return ok
 }
 
 // isFmtString checks whether the function has the "func() string" signature.
@@ -1039,7 +1099,7 @@ func isFmtString(function *types.Func) bool {
 		return false
 	}
 	result := results.At(0)
-	basic, ok := result.Type().(*types.Basic)
+	basic, ok := unwrapAlias(result.Type()).(*types.Basic)
 	if !ok {
 		return false
 	}

@@ -124,6 +124,40 @@ conventions.
 This check flags check whether name arguments are valid keys according to the
 [Kubernetes guidelines](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/migration-to-structured-logging.md#name-arguments).
 
+## value (disabled by default)
+
+This check flags types that inherit an incomplete `fmt.Stringer`
+implementation from an embedded field, for example a config struct embedding
+`metav1.TypeMeta`: the inherited `String()` covers only a subset of the
+value. Implement `String()` for the type itself instead.
+
+## nil-stringer (enabled by default)
+
+This check flags pointer values in structured logging calls whose
+`fmt.Stringer` implementation panics when the pointer is nil because calling
+`String()` must dereference the pointer, for example `*metav1.Time`. klog
+recovers from that panic and logs
+`key="<panic: runtime error: invalid memory address or nil pointer dereference>"`
+instead of the value; other `logr.Logger` implementations may crash. Wrap
+the value with
+[`klog.SafePtr`](https://pkg.go.dev/k8s.io/klog/v2#SafePtr).
+
+The pointer gets dereferenced when `String()` has a value receiver and when
+it is promoted from a field that is embedded by value, even if the method
+itself has a nil-safe pointer receiver. A `String()` method declared with a
+pointer receiver on the type itself is not flagged because such methods can
+handle nil themselves, like `*net.IPNet` does. Values that provably cannot
+be nil (taking the address of a value, `new`) are also not flagged.
+
+Known limitations, kept out of scope deliberately:
+
+- Only `fmt.Stringer` is checked. Logging implementations may also call
+  `error`, `logr.Marshaler` or `encoding.TextMarshaler` methods, which can
+  panic the same way.
+- Whether a flagged pointer can actually be nil at the call site is not
+  analyzed, so never-nil pointers may be flagged. Wrapping them with
+  `klog.SafePtr` is harmless.
+
 ## deprecations (enabled by default)
 
 This checks detects the usage of deprecated `klog` helper functions such as `KObjs` and suggests

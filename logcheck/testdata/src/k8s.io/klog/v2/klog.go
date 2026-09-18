@@ -231,7 +231,7 @@ func KRef(namespace, name string) interface{} {
 }
 
 // SafePtr emulates klog.SafePtr
-func SafePtr[T any, P *T](p P) any {
+func SafePtr[T any](p *T) any {
 	return nil
 }
 
