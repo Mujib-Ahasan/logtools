@@ -153,6 +153,17 @@ func TestAnalyzer(t *testing.T) {
 			testPackage: "stringer",
 		},
 		{
+			name:        "Detect nil-unsafe fmt.Stringer pointers",
+			testPackage: "nilStringer",
+		},
+		{
+			name: "Allow nil-unsafe fmt.Stringer pointers",
+			enabled: map[string]string{
+				"nil-stringer": "false",
+			},
+			testPackage: "nilStringerDisabled",
+		},
+		{
 			name: "Detect missing Logger field in config structs",
 			enabled: map[string]string{
 				"contextual":         "true",
