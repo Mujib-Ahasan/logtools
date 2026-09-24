@@ -134,7 +134,7 @@ klog methods (Info, Infof, Error, Errorf, Warningf, etc).`)
 			return run(pass, &c)
 		},
 		Flags:     logcheckFlags,
-		FactTypes: []analysis.Fact{new(warnContextual)},
+		FactTypes: []analysis.Fact{new(warnContextual), new(logKVWrapper)},
 	}, &c
 }
 
@@ -147,7 +147,26 @@ func (w warnContextual) AFact() {}
 
 func (w warnContextual) String() string { return string(w) }
 
+// logKVWrapper is a fact exported for functions or methods that forward
+// variadic key-value arguments to a structured logging call (klog.InfoS,
+// logr.Logger.Info etc.)
+type logKVWrapper struct {
+	KVArgIndex int
+}
+
+func (w logKVWrapper) AFact() {}
+
+func (w logKVWrapper) String() string {
+	return fmt.Sprintf("logKVWrapper(kvArgIndex=%d)", w.KVArgIndex)
+}
+
 func run(pass *analysis.Pass, c *Config) (interface{}, error) {
+	/* Pre-pass: scan for //logcheck:wrapper comments and export
+	   logKVWrapper facts before the main visitor so that wrapper call
+	   sites can be checked regardless of source order.
+	*/
+	detectMarkedWrappers(pass)
+
 	for _, file := range pass.Files {
 		// ancestors tracks the current path from the file down to the node
 		// that is currently visited. It is needed by checkForMissingLogger to
@@ -168,6 +187,7 @@ func run(pass *analysis.Pass, c *Config) (interface{}, error) {
 				// We are interested in function calls, as we want to detect klog.* calls
 				// passing all function calls to checkForFunctionExpr
 				checkForFunctionExpr(n, pass, c)
+				checkForWrapperCall(n, pass, c)
 				checkForMissingLogger(n, ancestors, pass, c)
 			case *ast.FuncType:
 				checkForContextAndLogger(n, n.Params, pass, c)
@@ -339,6 +359,56 @@ func checkForFunctionExpr(fexpr *ast.CallExpr, pass *analysis.Pass, c *Config) {
 		}
 
 	}
+}
+
+// checkForWrapperCall checks whether a call expression invokes a function
+// that has been identified as a log call wrapper (via the logKVWrapper fact).
+// if so, it applies the same key-value checks that would apply to the
+// underlying log call.
+func checkForWrapperCall(fexpr *ast.CallExpr, pass *analysis.Pass, c *Config) {
+	if fexpr.Ellipsis.IsValid() {
+		return
+	}
+
+	// Resolve the callee.
+	var obj types.Object
+	switch fun := fexpr.Fun.(type) {
+	case *ast.Ident:
+		obj = pass.TypesInfo.ObjectOf(fun)
+	case *ast.SelectorExpr:
+		obj = pass.TypesInfo.ObjectOf(fun.Sel)
+	default:
+		return
+	}
+	if obj == nil {
+		return
+	}
+
+	var fact logKVWrapper
+	if !pass.ImportObjectFact(obj, &fact) {
+		return
+	}
+
+	filename := pass.Pkg.Path() + "/" + path.Base(pass.Fset.Position(fexpr.Pos()).Filename)
+	keyCheckEnabled := c.isEnabled(keyCheck, filename)
+	parametersCheckEnabled := c.isEnabled(parametersCheck, filename)
+	valueCheckEnabled := c.isEnabled(valueCheck, filename)
+	nilStringerCheckEnabled := c.isEnabled(nilStringerCheck, filename)
+
+	if !keyCheckEnabled && !parametersCheckEnabled && !valueCheckEnabled && !nilStringerCheckEnabled {
+		return
+	}
+
+	args := fexpr.Args
+	if fact.KVArgIndex > len(args) {
+		return
+	}
+
+	if parametersCheckEnabled && checkForFormatSpecifier(fexpr, pass) {
+		return
+	}
+
+	kvCheck(args[fact.KVArgIndex:], fexpr.Fun, pass, obj.Name(), keyCheckEnabled, parametersCheckEnabled, valueCheckEnabled, nilStringerCheckEnabled)
 }
 
 // isKlogVerbose returns true if the type of the expression is klog.Verbose (=
@@ -1137,6 +1207,10 @@ func checkForComments(object types.Object, doc *ast.CommentGroup, pass *analysis
 		if !found {
 			continue
 		}
+		// //logcheck:wrapper is handled by the detectMarkedWrappers pre-pass.
+		if strings.TrimSpace(text) == wrapperKeyword {
+			continue
+		}
 		text, found = strings.CutPrefix(text, contextKeyword)
 		if !found {
 			pass.Report(analysis.Diagnostic{
@@ -1167,8 +1241,88 @@ func unwrapAlias(t types.Type) types.Type {
 	}
 }
 
+// findVariadicKVParam checks whether a function signature has a variadic
+// last parameter of type interface{} (the element type, not the slice).
+// It returns the parameter index if so, or -1 otherwise.
+func findVariadicKVParam(sig *types.Signature) int {
+	if !sig.Variadic() {
+		return -1
+	}
+	params := sig.Params()
+	if params.Len() == 0 {
+		return -1
+	}
+	last := params.At(params.Len() - 1)
+	// The variadic parameter's type is a slice; check the element type.
+	slice, ok := unwrapAlias(last.Type()).(*types.Slice)
+	if !ok {
+		return -1
+	}
+	iface, ok := unwrapAlias(slice.Elem()).(*types.Interface)
+	if !ok || !iface.Empty() {
+		return -1
+	}
+	return params.Len() - 1
+}
+
+// detectMarkedWrappers scans all function declarations for //logcheck:wrapper
+// comments and exports logKVWrapper facts for them. This runs as a pre-pass
+// before the main visitor so that call sites can be checked regardless of
+// source order within a package.
+func detectMarkedWrappers(pass *analysis.Pass) {
+	for _, file := range pass.Files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			funcDecl, ok := n.(*ast.FuncDecl)
+			if !ok || funcDecl.Doc == nil {
+				return true
+			}
+			if !hasLogcheckMarker(funcDecl.Doc, wrapperKeyword) {
+				return true
+			}
+			obj := pass.TypesInfo.ObjectOf(funcDecl.Name)
+			if obj == nil {
+				return true
+			}
+			funcObj, ok := obj.(*types.Func)
+			if !ok {
+				return true
+			}
+			sig, ok := funcObj.Type().(*types.Signature)
+			if !ok {
+				return true
+			}
+			kvArgIndex := findVariadicKVParam(sig)
+			if kvArgIndex < 0 {
+				pass.Report(analysis.Diagnostic{
+					Pos:     funcDecl.Pos(),
+					Message: fmt.Sprintf("%s is marked as //logcheck:wrapper but does not have a variadic ...interface{} parameter", funcDecl.Name.Name),
+				})
+				return true
+			}
+			fact := logKVWrapper{KVArgIndex: kvArgIndex}
+			pass.ExportObjectFact(obj, &fact)
+			return true
+		})
+	}
+}
+
+func hasLogcheckMarker(doc *ast.CommentGroup, keyword string) bool {
+	for _, comment := range doc.List {
+		text := comment.Text
+		text, found := strings.CutPrefix(text, logcheckPrefix)
+		if !found {
+			continue
+		}
+		if strings.TrimSpace(text) == keyword {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	logcheckPrefix = "//logcheck:"
 	contextKeyword = "context"
+	wrapperKeyword = "wrapper"
 	commentSep     = "//"
 )
