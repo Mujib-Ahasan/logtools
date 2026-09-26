@@ -157,7 +157,7 @@ type logKVWrapper struct {
 func (w logKVWrapper) AFact() {}
 
 func (w logKVWrapper) String() string {
-	return fmt.Sprintf("logKVWrapper(kvArgIndex=%d)", w.KVArgIndex)
+	return fmt.Sprintf("logKVWrapper at index %d", w.KVArgIndex)
 }
 
 func run(pass *analysis.Pass, c *Config) (interface{}, error) {
@@ -1265,45 +1265,147 @@ func findVariadicKVParam(sig *types.Signature) int {
 	return params.Len() - 1
 }
 
-// detectMarkedWrappers scans all function declarations for //logcheck:wrapper
-// comments and exports logKVWrapper facts for them. This runs as a pre-pass
-// before the main visitor so that call sites can be checked regardless of
-// source order within a package.
+/*
+	 detectMarkedWrappers scans all function and variable declarations for
+	 //logcheck:wrapper comments and exports logKVWrapper facts for them.
+	 It also auto-detects variable aliases of known klog/logr structured
+	 logging functions without requiring a marker.
+
+	 like:
+
+	    //logcheck:wrapper
+		func myLog(msg string, kvs ...interface{}) { ... }
+
+		//logcheck:wrapper
+		var myLog func(msg string, kvs ...interface{})
+
+		var myLog = klog.InfoS  <- auto-detected, no marker needed
+*/
 func detectMarkedWrappers(pass *analysis.Pass) {
 	for _, file := range pass.Files {
 		ast.Inspect(file, func(n ast.Node) bool {
-			funcDecl, ok := n.(*ast.FuncDecl)
-			if !ok || funcDecl.Doc == nil {
-				return true
+			switch n := n.(type) {
+			case *ast.FuncDecl:
+				if n.Doc == nil || !hasLogcheckMarker(n.Doc, wrapperKeyword) {
+					return true
+				}
+				obj := pass.TypesInfo.ObjectOf(n.Name)
+				if obj == nil {
+					return true
+				}
+				sig := sigFromObject(obj)
+				if sig == nil {
+					return true
+				}
+				exportWrapperFact(pass, obj, sig, n.Pos(), n.Name.Name)
+			case *ast.GenDecl:
+				if n.Tok != token.VAR {
+					return true
+				}
+				hasMarker := n.Doc != nil && hasLogcheckMarker(n.Doc, wrapperKeyword)
+				for _, spec := range n.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for i, name := range vs.Names {
+						obj := pass.TypesInfo.ObjectOf(name)
+						if obj == nil {
+							continue
+						}
+						if hasMarker {
+							// Explicit marker: derive from the variable's type.
+							sig := sigFromObject(obj)
+							if sig == nil {
+								continue
+							}
+							exportWrapperFact(pass, obj, sig, n.Pos(), name.Name)
+						} else if i < len(vs.Values) {
+							// No marker: auto-detect if the initializer
+							// is a known klog/logr structured log function.
+							detectLogFuncAlias(pass, obj, vs.Values[i])
+						}
+					}
+				}
 			}
-			if !hasLogcheckMarker(funcDecl.Doc, wrapperKeyword) {
-				return true
-			}
-			obj := pass.TypesInfo.ObjectOf(funcDecl.Name)
-			if obj == nil {
-				return true
-			}
-			funcObj, ok := obj.(*types.Func)
-			if !ok {
-				return true
-			}
-			sig, ok := funcObj.Type().(*types.Signature)
-			if !ok {
-				return true
-			}
-			kvArgIndex := findVariadicKVParam(sig)
-			if kvArgIndex < 0 {
-				pass.Report(analysis.Diagnostic{
-					Pos:     funcDecl.Pos(),
-					Message: fmt.Sprintf("%s is marked as //logcheck:wrapper but does not have a variadic ...interface{} parameter", funcDecl.Name.Name),
-				})
-				return true
-			}
-			fact := logKVWrapper{KVArgIndex: kvArgIndex}
-			pass.ExportObjectFact(obj, &fact)
 			return true
 		})
 	}
+}
+
+// detectLogFuncAlias checks whether a variable initializer refers to a
+// known klog or logr structured logging function (like: var logSomething = klog.InfoS).
+// If yes then it exports a logKVWrapper fact for the variable.
+func detectLogFuncAlias(pass *analysis.Pass, obj types.Object, init ast.Expr) {
+	selExpr, ok := init.(*ast.SelectorExpr)
+	if !ok {
+		return
+	}
+	fName := selExpr.Sel.Name
+
+	isStructuredLogFunc := false
+	if isPackage(selExpr.X, "k8s.io/klog/v2", pass) {
+		switch fName {
+		case "InfoS", "ErrorS", "LoggerWithValues":
+			isStructuredLogFunc = true
+		}
+	}
+	// logr methods would not appear as variable
+	// initializers since they are bound methods, so we only need to
+	// check klog package-level functions here.
+
+	if !isStructuredLogFunc {
+		return
+	}
+
+	// Get the signature from the referenced function to derive KVArgIndex.
+	rhsObj := pass.TypesInfo.ObjectOf(selExpr.Sel)
+	if rhsObj == nil {
+		return
+	}
+	funcObj, ok := rhsObj.(*types.Func)
+	if !ok {
+		return
+	}
+	sig, ok := funcObj.Type().(*types.Signature)
+	if !ok {
+		return
+	}
+	kvArgIndex := findVariadicKVParam(sig)
+	if kvArgIndex < 0 {
+		return
+	}
+	fact := logKVWrapper{KVArgIndex: kvArgIndex}
+	pass.ExportObjectFact(obj, &fact)
+}
+
+// sigFromObject extracts a *types.Signature from either a *types.Func
+// or a *types.Var with a function type.
+func sigFromObject(obj types.Object) *types.Signature {
+	switch obj := obj.(type) {
+	case *types.Func:
+		sig, _ := obj.Type().(*types.Signature)
+		return sig
+	case *types.Var:
+		sig, _ := unwrapAlias(obj.Type()).(*types.Signature)
+		return sig
+	}
+	return nil
+}
+
+// exportWrapperFact validates the signature and exports a logKVWrapper fact
+// for the given object.
+func exportWrapperFact(pass *analysis.Pass, obj types.Object, sig *types.Signature, pos token.Pos, name string) {
+	kvArgIndex := findVariadicKVParam(sig)
+	if kvArgIndex < 0 {
+		pass.Report(analysis.Diagnostic{
+			Pos:     pos,
+			Message: fmt.Sprintf("%s is marked as //logcheck:wrapper but does not have a variadic ...interface{} parameter", name),
+		})
+		return
+	}
+	fact := logKVWrapper{KVArgIndex: kvArgIndex}
+	pass.ExportObjectFact(obj, &fact)
 }
 
 func hasLogcheckMarker(doc *ast.CommentGroup, keyword string) bool {
