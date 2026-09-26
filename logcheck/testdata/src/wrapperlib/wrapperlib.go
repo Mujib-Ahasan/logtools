@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,13 +25,13 @@ import (
 // LogInfo wraps klog.InfoS and is exported for use in other packages.
 //
 //logcheck:wrapper
-func LogInfo(msg string, kvs ...interface{}) { // want LogInfo:"logKVWrapper\\(kvArgIndex=1\\)"
+func LogInfo(msg string, kvs ...interface{}) { // want LogInfo:"logKVWrapper at index 1"
 	klog.InfoS(msg, kvs...)
 }
 
 // LogError wraps klog.ErrorS and is exported for use in other packages.
 //
 //logcheck:wrapper
-func LogError(err error, msg string, kvs ...interface{}) { // want LogError:"logKVWrapper\\(kvArgIndex=2\\)"
+func LogError(err error, msg string, kvs ...interface{}) { // want LogError:"logKVWrapper at index 2"
 	klog.ErrorS(err, msg, kvs...)
 }

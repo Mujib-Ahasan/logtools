@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,32 +29,32 @@ var logger logr.Logger
 // --- Wrapper definitions (marked with //logcheck:wrapper) ---
 
 //logcheck:wrapper
-func logInfoKlog(msg string, kvs ...interface{}) { // want logInfoKlog:"logKVWrapper\\(kvArgIndex=1\\)"
+func logInfoKlog(msg string, kvs ...interface{}) { // want logInfoKlog:"logKVWrapper at index 1"
 	klog.InfoS(msg, kvs...)
 }
 
 //logcheck:wrapper
-func logErrorKlog(err error, msg string, kvs ...interface{}) { // want logErrorKlog:"logKVWrapper\\(kvArgIndex=2\\)"
+func logErrorKlog(err error, msg string, kvs ...interface{}) { // want logErrorKlog:"logKVWrapper at index 2"
 	klog.ErrorS(err, msg, kvs...)
 }
 
 //logcheck:wrapper
-func logInfoLogr(l logr.Logger, msg string, kvs ...interface{}) { // want logInfoLogr:"logKVWrapper\\(kvArgIndex=2\\)"
+func logInfoLogr(l logr.Logger, msg string, kvs ...interface{}) { // want logInfoLogr:"logKVWrapper at index 2"
 	l.Info(msg, kvs...)
 }
 
 //logcheck:wrapper
-func logErrorLogr(l logr.Logger, err error, msg string, kvs ...interface{}) { // want logErrorLogr:"logKVWrapper\\(kvArgIndex=3\\)"
+func logErrorLogr(l logr.Logger, err error, msg string, kvs ...interface{}) { // want logErrorLogr:"logKVWrapper at index 3"
 	l.Error(err, msg, kvs...)
 }
 
 //logcheck:wrapper
-func withValuesLogr(l logr.Logger, kvs ...interface{}) logr.Logger { // want withValuesLogr:"logKVWrapper\\(kvArgIndex=1\\)"
+func withValuesLogr(l logr.Logger, kvs ...interface{}) logr.Logger { // want withValuesLogr:"logKVWrapper at index 1"
 	return l.WithValues(kvs...)
 }
 
 //logcheck:wrapper
-func withValuesKlog(l logr.Logger, kvs ...interface{}) logr.Logger { // want withValuesKlog:"logKVWrapper\\(kvArgIndex=1\\)"
+func withValuesKlog(l logr.Logger, kvs ...interface{}) logr.Logger { // want withValuesKlog:"logKVWrapper at index 1"
 	return klog.LoggerWithValues(l, kvs...)
 }
 
@@ -62,7 +62,7 @@ func withValuesKlog(l logr.Logger, kvs ...interface{}) logr.Logger { // want wit
 // that its own call sites are checked.
 //
 //logcheck:wrapper
-func chainedWrapper(msg string, kvs ...interface{}) { // want chainedWrapper:"logKVWrapper\\(kvArgIndex=1\\)"
+func chainedWrapper(msg string, kvs ...interface{}) { // want chainedWrapper:"logKVWrapper at index 1"
 	logInfoKlog(msg, kvs...)
 }
 
@@ -70,7 +70,7 @@ func chainedWrapper(msg string, kvs ...interface{}) { // want chainedWrapper:"lo
 type Handler struct{}
 
 //logcheck:wrapper
-func (h *Handler) Log(msg string, kvs ...interface{}) { // want Log:"logKVWrapper\\(kvArgIndex=1\\)"
+func (h *Handler) Log(msg string, kvs ...interface{}) { // want Log:"logKVWrapper at index 1"
 	klog.InfoS(msg, kvs...)
 }
 
@@ -80,6 +80,21 @@ func notAWrapper(msg string, args ...interface{}) {
 	_ = msg
 	_ = args
 }
+
+// --- Variable-based wrappers ---
+
+// logViaAlias is a variable holding a direct reference to klog.InfoS.
+// Auto-detected without a marker.
+var logViaAlias = klog.InfoS // want logViaAlias:"logKVWrapper at index 1"
+
+// logViaErrorAlias is a variable holding a direct reference to klog.ErrorS.
+// Auto-detected without a marker.
+var logViaErrorAlias = klog.ErrorS // want logViaErrorAlias:"logKVWrapper at index 2"
+
+// logViaFuncVar is a function variable with the marker but unknown implementation.
+//
+//logcheck:wrapper
+var logViaFuncVar func(msg string, kvs ...interface{}) // want logViaFuncVar:"logKVWrapper at index 1"
 
 // --- Call sites ---
 
@@ -124,4 +139,22 @@ func callSites() {
 
 	// Not a wrapper, should NOT flag
 	notAWrapper("msg", "key")
+
+	// Variable alias wrapper (auto-detected), odd args (should flag)
+	logViaAlias("msg", "key") // want `Additional arguments to logViaAlias should always be Key Value pairs. Please check if there is any key or value missing.`
+
+	// Variable alias wrapper (auto-detected), correct args (should NOT flag)
+	logViaAlias("msg", "key", "value")
+
+	// ErrorS alias (auto-detected), odd args (should flag)
+	logViaErrorAlias(nil, "msg", "key") // want `Additional arguments to logViaErrorAlias should always be Key Value pairs. Please check if there is any key or value missing.`
+
+	// ErrorS alias (auto-detected), correct args (should NOT flag)
+	logViaErrorAlias(nil, "msg", "key", "value")
+
+	// Function variable wrapper, odd args (should flag)
+	logViaFuncVar("msg", "key") // want `Additional arguments to logViaFuncVar should always be Key Value pairs. Please check if there is any key or value missing.`
+
+	// Function variable wrapper, correct args (should NOT flag)
+	logViaFuncVar("msg", "key", "value")
 }
